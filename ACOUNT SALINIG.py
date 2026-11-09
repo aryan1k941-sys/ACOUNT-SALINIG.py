@@ -60,7 +60,7 @@ from telethon.tl.functions.account import GetPasswordRequest
 # ================= CONFIGURATION =================
 API_ID = 39776296 
 API_HASH = "39750d30671418c6fd01a96b6296ee82"
-BOT_TOKEN = "9096576464:AAHuqy3NylC3ZFh9MBsHyyrU3L2y4QE0xp8" 
+BOT_TOKEN = "9263012433:AAEDWHaVcYrvC2EgxJIcNbqCpqdfBCHv7iI" 
 ADMIN_ID = 8781077406 
 
 P_YES = ''
