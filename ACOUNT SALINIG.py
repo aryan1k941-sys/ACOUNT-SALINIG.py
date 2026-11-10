@@ -63,7 +63,7 @@ from telethon.tl.functions.account import GetPasswordRequest
 # ================= CONFIGURATION =================
 API_ID = 39776296 
 API_HASH = "39750d30671418c6fd01a96b6296ee82"
-BOT_TOKEN = "9263012433:AAEDWHaVcYrvC2EgxJIcNbqCpqdfBCHv7iI" 
+BOT_TOKEN = "9263012433:AAHD0ltK5Id749MG6_3YNFDbhoLtoA7APP4" 
 ADMIN_ID = 8781077406 
 
 # ================= TELEGRAM CUSTOM EMOJI CONSTANTS (UPDATED) =================
@@ -342,6 +342,10 @@ def setup_db():
   cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('sgvip_enabled', 'off')")
   cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('sgvip_api_url', 'https://sgvip.site')")
   cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('sgvip_user_token', '')")
+  for _k, _v in (('proofs_url', 'https://t.me/TG_ACCOUNT_070_BOT'), ('min_deposit', '10'),
+                 ('notify_new_user', 'on'), ('notify_sale_dm', 'on'), ('daily_report', 'on'),
+                 ('low_stock_alerts', 'on'), ('low_stock_threshold', '3'), ('last_daily_report', '')):
+    cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (_k, _v))
   cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('log_channel_id', '-1003940330621')")
   cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('support_url', 'https://t.me/XLARYAN_0100')")
   cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('support_channel_url', 'https://t.me/FREEARUAN')")
@@ -971,7 +975,7 @@ def _bot_api_post(method, payload):
   with urllib.request.urlopen(req, timeout=20) as response:
     return json.loads(response.read().decode("utf-8", errors="replace"))
 
-async def _send_selling_log(msg):
+async def _post_log_channel(msg):
   """Post to the logs channel. Telethon first; Bot API HTTP as a fallback
   (Telethon cannot always resolve a channel ID the bot has not 'seen' yet)."""
   text = custom_emoji_text(msg)
@@ -1003,6 +1007,22 @@ async def _send_selling_log(msg):
   except Exception as ex:
     logger.error(f"Selling log send failed (Bot API): {ex}")
     return False
+
+async def notify_admins(msg, ids=None):
+  """DM the owner and all sub-admins."""
+  text = custom_emoji_text(msg)
+  for admin_id in (ids or get_all_admin_ids()):
+    try:
+      await bot.send_message(int(admin_id), text, parse_mode='html')
+    except Exception as ex:
+      logger.error(f"Admin notify failed for {admin_id}: {ex}")
+
+async def _send_selling_log(msg, dm_admins=True):
+  """Every sale/deposit: post in the logs channel AND DM all admins."""
+  ok = await _post_log_channel(msg)
+  if dm_admins and get_setting('notify_sale_dm', 'on') == 'on':
+    await notify_admins(msg)
+  return ok
 
 async def log_primary_deposit(uid, amt, method):
   """Successful deposit log only. Verification/pending screenshots never go to the log channel."""
@@ -1082,6 +1102,8 @@ async def log_digital_sale(uid, product_name, price):
 
 async def notify_new_user(uid, event):
   """Notify the owner in DM once when a genuinely new user is created."""
+  if get_setting('notify_new_user', 'on') != 'on':
+    return
   try:
     sender = await event.get_sender()
     name = getattr(sender, 'first_name', None) or 'Unknown'
@@ -1093,7 +1115,8 @@ async def notify_new_user(uid, event):
       f"{P_ACC} Username: @{html.escape(username) if username else 'NoUsername'}\n"
       f"{P_TIME} Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     )
-    await bot.send_message(custom_emoji_text(ADMIN_ID), custom_emoji_text(msg), parse_mode='html')
+    total_users = cur.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    await notify_admins(msg + f"\nTotal Users: <b>{total_users}</b>")
   except Exception as ex:
     logger.error(f"New user admin notification failed: {ex}")
 
@@ -1130,7 +1153,7 @@ def get_persistent_menu(uid):
       Button.inline("Refill", data="cb_refill", style="primary"),
       Button.inline("Redeem Code", data="redeem_start", style="success")
     ],
-    [Button.url(" Selling Logs", "https://t.me/TG_ACCOUNT_070_BOT", style="primary")],
+    [Button.url("Proofs", get_proofs_url(), style="primary")],
     [support_btn],
     [updates_btn]
   ]
@@ -1690,6 +1713,15 @@ GATEWAYS = {
             'key_label': 'User Token', 'kind': 'sgvip'},
 }
 
+def get_min_deposit():
+  try:
+    return max(1, int(get_setting('min_deposit', '10')))
+  except (TypeError, ValueError):
+    return 10
+
+def get_proofs_url():
+  return _normalize_tg_url(get_setting('proofs_url', ''), "") or "https://t.me/TG_ACCOUNT_070_BOT"
+
 def gw_config(provider):
   g = GATEWAYS[provider]
   base = get_setting(g['url'], g['default_url']).strip().rstrip('/')
@@ -1823,7 +1855,7 @@ async def gw_verify_order(provider, order_id):
       status = 'failed'
     else:
       status = 'pending'
-    return {'status': status, 'amount': inner.get('amount'), 'utr': inner.get('utr')}
+    return {'status': status, 'amount': inner.get('amount'), 'utr': (str(inner.get('utr') or '').strip() or f'SGVIP-{order_id}')}
 
   result = await asyncio.to_thread(
     famgateway_request, '/api/verify-order.php', key, None,
@@ -1894,8 +1926,154 @@ async def credit_famgateway_deposit(dep_id, verified):
     logger.exception('Could not notify user after gateway credit')
   return True
 
+# ---------- QR code payments ----------
+import io
+_verify_cooldown = {}
+PAID_STATES = ('success', 'paid', 'completed')
+
+def _qr_png_local(data):
+  """Generate a QR PNG locally (needs `pip install "qrcode[pil]"`; segno also works)."""
+  try:
+    import qrcode
+    img = qrcode.make(data, box_size=10, border=3)
+    buf = io.BytesIO(); img.save(buf, format='PNG')
+    return buf.getvalue()
+  except Exception:
+    pass
+  try:
+    import segno
+    buf = io.BytesIO(); segno.make(data, error='m').save(buf, kind='png', scale=10, border=3)
+    return buf.getvalue()
+  except Exception:
+    return None
+
+def _http_get_bytes(url, limit=2_000_000):
+  req = urllib.request.Request(url, headers={'User-Agent': 'AccStoreTelegramBot/1.0'})
+  with urllib.request.urlopen(req, timeout=15) as response:
+    data = response.read(limit + 1)
+  if len(data) > limit:
+    raise ValueError('Image too large')
+  return data
+
+def _looks_like_image(data):
+  return bool(data) and (data[:8] == b'\x89PNG\r\n\x1a\n' or data[:3] == b'\xff\xd8\xff' or data[:4] == b'GIF8' or (data[:4] == b'RIFF' and data[8:12] == b'WEBP'))
+
+def _qr_png_online(data):
+  return _http_get_bytes('https://api.qrserver.com/v1/create-qr-code/?size=600x600&margin=12&data=' + quote(data, safe=''))
+
+async def make_payment_qr(order, checkout_url):
+  """Return (png_bytes_or_None, qr_is_upi). qr_is_upi=True means any UPI app can scan it directly."""
+  payload = ''
+  upi = next((str(v).strip() for v in order.values() if isinstance(v, str) and v.strip().lower().startswith('upi://')), '')
+  if upi:
+    payload, is_upi = upi, True
+  else:
+    qr_url = str(order.get('qr_url') or '').strip()
+    if qr_url.startswith('https://'):
+      try:
+        img = await asyncio.to_thread(_http_get_bytes, qr_url)
+        if _looks_like_image(img):
+          return img, True
+      except Exception as ex:
+        logger.warning('Gateway QR image download failed: %s', ex)
+    payload, is_upi = checkout_url, False
+  if not payload:
+    return None, False
+  png = await asyncio.to_thread(_qr_png_local, payload)
+  if not png:
+    try:
+      png = await asyncio.to_thread(_qr_png_online, payload)
+      if not _looks_like_image(png):
+        png = None
+    except Exception as ex:
+      logger.warning('Online QR generation failed: %s', ex)
+      png = None
+  return png, is_upi
+
+async def check_and_credit_deposit(dep_id):
+  """One authoritative gateway check. Returns (state, order_id); state in
+  approved/credited/pending/expired/error/credit_failed/notfound."""
+  row = cur.execute("SELECT status, gateway_order_id, gateway_provider FROM deposits WHERE id=?", (int(dep_id),)).fetchone()
+  if not row:
+    return 'notfound', ''
+  status, order_id, provider = row
+  if status == 'approved':
+    return 'approved', order_id
+  if status != 'pending':
+    return 'expired', order_id
+  provider = provider if provider in GATEWAYS else 'famgateway'
+  try:
+    result = await gw_verify_order(provider, order_id)
+  except Exception as ex:
+    logger.warning('Manual verify error for %s (%s): %s', order_id, provider, ex)
+    return 'error', order_id
+  st = str(result.get('status') or '').lower()
+  if st in PAID_STATES:
+    ok = await credit_famgateway_deposit(dep_id, result)
+    now = cur.execute("SELECT status FROM deposits WHERE id=?", (int(dep_id),)).fetchone()
+    if ok or (now and now[0] == 'approved'):
+      return 'credited', order_id
+    return 'credit_failed', order_id
+  if st in ('expired', 'failed', 'cancelled'):
+    cur.execute("UPDATE deposits SET status='expired' WHERE id=? AND status='pending'", (int(dep_id),))
+    db.commit()
+    return 'expired', order_id
+  return 'pending', order_id
+
+async def _finish_deposit_message(chat_id, message_id, text=None, buttons=None):
+  """Remove the QR message (a caption edit would leave the old QR visible) and optionally post a clean text."""
+  if not chat_id:
+    return
+  if message_id:
+    try:
+      await bot.delete_messages(chat_id, message_id)
+    except Exception:
+      pass
+  if text:
+    try:
+      await bot.send_message(chat_id, custom_emoji_text(text), buttons=buttons, parse_mode='html')
+    except Exception:
+      pass
+
+async def handle_verify_payment(e, uid, dep_id):
+  now = time.time()
+  if now - _verify_cooldown.get(uid, 0) < 3:
+    return await safe_callback_answer(e, 'Please wait a few seconds before checking again.', alert=False)
+  _verify_cooldown[uid] = now
+  owner = cur.execute("SELECT user_id FROM deposits WHERE id=?", (int(dep_id),)).fetchone()
+  if not owner or int(owner[0]) != int(uid):
+    return await safe_callback_answer(e, 'Payment order not found.', alert=True)
+  state, order_id = await check_and_credit_deposit(dep_id)
+  if state in ('credited', 'approved'):
+    await safe_callback_answer(e, 'Payment verified! Your wallet has been credited.', alert=True)
+    return await _finish_deposit_message(e.chat_id, e.message_id)
+  if state == 'pending':
+    return await safe_callback_answer(e, 'Payment not received yet. Complete the payment, wait a few seconds, then tap Verify Payment again.', alert=True)
+  if state == 'credit_failed':
+    return await safe_callback_answer(e, f'Payment found but could not be credited automatically. Contact support with order ID {order_id}.', alert=True)
+  if state == 'error':
+    return await safe_callback_answer(e, 'Could not reach the payment gateway. Please try again in a moment.', alert=True)
+  await safe_callback_answer(e, 'This payment order has expired. Please create a new one.', alert=True)
+  return await _finish_deposit_message(e.chat_id, e.message_id, f"{P_WARN} <b>Payment session expired.</b>\nPlease create a new payment order.", [[Button.inline('Try Again', 'dep_menu_cb', style='primary')]])
+
+async def handle_cancel_deposit(e, uid, dep_id):
+  owner = cur.execute("SELECT user_id FROM deposits WHERE id=?", (int(dep_id),)).fetchone()
+  if not owner or int(owner[0]) != int(uid):
+    return await safe_callback_answer(e, 'Payment order not found.', alert=True)
+  # If the user already paid, credit instead of cancelling.
+  state, _ = await check_and_credit_deposit(dep_id)
+  if state in ('credited', 'approved'):
+    await safe_callback_answer(e, 'Your payment was received and credited to your wallet.', alert=True)
+    return await _finish_deposit_message(e.chat_id, e.message_id)
+  if state == 'error':
+    return await safe_callback_answer(e, 'Could not check the gateway right now. Please try Cancel again in a moment.', alert=True)
+  cur.execute("UPDATE deposits SET status='expired' WHERE id=? AND user_id=? AND status='pending'", (int(dep_id), int(uid)))
+  db.commit()
+  await safe_callback_answer(e, 'Payment cancelled.', alert=False)
+  return await _finish_deposit_message(e.chat_id, e.message_id, f"{P_NO} <b>Payment cancelled.</b>", [[Button.inline('Add Funds', 'dep_menu_cb', style='primary')]])
+
 async def poll_famgateway_deposit(dep_id, order_id, chat_id=None, message_id=None):
-  """Poll the authoritative gateway status; safe to resume after restart."""
+  """Background auto-verification; safe to resume after restart. The user can also tap Verify Payment."""
   prow = cur.execute('SELECT gateway_provider FROM deposits WHERE id=?', (int(dep_id),)).fetchone()
   provider = (prow[0] if prow and prow[0] in GATEWAYS else 'famgateway')
   limit = 1800 if GATEWAYS[provider]['kind'] == 'sgvip' else 330
@@ -1903,43 +2081,29 @@ async def poll_famgateway_deposit(dep_id, order_id, chat_id=None, message_id=Non
   while time.time() - started < limit:
     row = cur.execute('SELECT status FROM deposits WHERE id=?', (int(dep_id),)).fetchone()
     if not row or row[0] != 'pending':
+      if row and row[0] == 'approved':
+        await _finish_deposit_message(chat_id, message_id)
       return
     try:
       result = await gw_verify_order(provider, order_id)
       status = str(result.get('status') or '').lower()
-      if status in ('success', 'paid', 'completed'):
+      if status in PAID_STATES:
         if await credit_famgateway_deposit(dep_id, result):
-          if chat_id and message_id:
-            try:
-              await bot.edit_message(chat_id, message_id, custom_emoji_text(
-                f"{P_YES} <b>Payment Successful!</b>\n\nOrder: <code>{html.escape(order_id)}</code>\nYour wallet has been credited automatically."
-              ), buttons=None)
-            except Exception:
-              pass
+          await _finish_deposit_message(chat_id, message_id)
           return
       elif status in ('expired', 'failed', 'cancelled'):
         cur.execute("UPDATE deposits SET status='expired' WHERE id=? AND status='pending'", (int(dep_id),))
         db.commit()
-        if chat_id and message_id:
-          try:
-            await bot.edit_message(chat_id, message_id, custom_emoji_text(
-              f"{P_WARN} <b>Payment session expired.</b>\nPlease create a new payment order."
-            ), buttons=[[Button.inline('Try Again', 'dep_menu_cb', style='primary')]])
-          except Exception:
-            pass
+        await _finish_deposit_message(chat_id, message_id, f"{P_WARN} <b>Payment session expired.</b>\nPlease create a new payment order.", [[Button.inline('Try Again', 'dep_menu_cb', style='primary')]])
         return
     except Exception as ex:
       logger.warning('Gateway poll error for %s (%s): %s', order_id, provider, ex)
     await asyncio.sleep(5)
-  cur.execute("UPDATE deposits SET status='expired' WHERE id=? AND status='pending'", (int(dep_id),))
-  db.commit()
-  if chat_id and message_id:
-    try:
-      await bot.edit_message(chat_id, message_id, custom_emoji_text(
-        f"{P_WARN} <b>Payment order timed out.</b>\nIf you paid, contact support with order ID <code>{html.escape(order_id)}</code>."
-      ), buttons=[[Button.inline('Back', 'dep_menu_cb', style='primary')]])
-    except Exception:
-      pass
+  row = cur.execute('SELECT status FROM deposits WHERE id=?', (int(dep_id),)).fetchone()
+  if row and row[0] == 'pending':
+    cur.execute("UPDATE deposits SET status='expired' WHERE id=? AND status='pending'", (int(dep_id),))
+    db.commit()
+    await _finish_deposit_message(chat_id, message_id, f"{P_WARN} <b>Payment order timed out.</b>\nIf you paid, contact support with order ID <code>{html.escape(order_id)}</code>.", [[Button.inline('Back', 'dep_menu_cb', style='primary')]])
 
 async def deposit_menu(event):
   uid = event.sender_id
@@ -1951,7 +2115,7 @@ async def deposit_menu(event):
     deposit_input[uid] = {'step': 'amount_keypad', 'provider': providers[0], 'amount': ''}
     return await show_deposit_amount_keypad(event, uid)
   deposit_input.pop(uid, None)
-  msg = f"{P_CARD} <b>Add Wallet Funds</b>\n\nSelect a payment gateway. Minimum deposit: <b>₹10</b>."
+  msg = f"{P_CARD} <b>Add Wallet Funds</b>\n\nSelect a payment gateway. Minimum deposit: <b>₹{get_min_deposit()}</b>."
   btns = [[Button.inline(GATEWAYS[p]['label'], f'dep_gw|{p}', style='success')] for p in providers]
   btns.append([Button.inline('Back', 'back_main', style='primary')])
   await e_edit_or_send(event, custom_emoji_text(msg), btns)
@@ -1991,8 +2155,8 @@ async def generate_deposit_qr(event, uid):
     amount = int(state.get('amount') or 0)
   except (TypeError, ValueError):
     amount = 0
-  if amount < 10:
-    return await safe_callback_answer(event, 'Minimum deposit is ₹10.', alert=True)
+  if amount < get_min_deposit():
+    return await safe_callback_answer(event, f'Minimum deposit is ₹{get_min_deposit()}.', alert=True)
   if not gw_ready(provider):
     deposit_input.pop(uid, None)
     return await safe_callback_answer(event, f'{label} is currently unavailable.', alert=True)
@@ -2010,15 +2174,29 @@ async def generate_deposit_qr(event, uid):
     )
     db.commit()
     dep_id = cur.lastrowid
+    png, qr_is_upi = await make_payment_qr(order, checkout_url)
+    if png and qr_is_upi:
+      how = "Scan this QR with any UPI app (GPay, PhonePe, Paytm, BHIM) and pay the exact amount."
+    elif png:
+      how = "Scan this QR with your phone camera to open the secure payment page, or tap <b>Open Pay Page</b>."
+    else:
+      how = "Tap <b>Open Pay Page</b> and complete the UPI payment."
     caption = (
       f"{P_CARD} <b>{html.escape(label)} Payment</b>\n\n"
       f"{P_MONEY} Amount: <b>₹{html.escape(str(payable))}</b>\n"
       f"Order ID: <code>{html.escape(order_id)}</code>\n\n"
-      f"Tap <b>Pay Now</b> and complete UPI payment on the secure checkout page.\n"
-      f"Wallet balance will be added automatically after gateway verification."
+      f"{how}\n"
+      f"After paying, tap <b>Verify Payment</b>. Your wallet is also credited automatically."
     )
-    buttons = [[Button.url('Pay Now', checkout_url, style='success')], [Button.inline('Cancel', 'cancel_action', style='danger')]]
-    sent = await bot.send_message(uid, custom_emoji_text(caption), buttons=buttons, parse_mode='html')
+    rows = [[Button.inline('Verify Payment', f'dep_verify|{dep_id}', style='success')]]
+    if checkout_url.startswith('https://') and (not qr_is_upi or not png):
+      rows.append([Button.url('Open Pay Page', checkout_url, style='primary')])
+    rows.append([Button.inline('Cancel', f'dep_cancel|{dep_id}', style='danger')])
+    if png:
+      bio = io.BytesIO(png); bio.name = 'payment_qr.png'
+      sent = await bot.send_file(uid, bio, caption=custom_emoji_text(caption), buttons=rows, parse_mode='html')
+    else:
+      sent = await bot.send_message(uid, custom_emoji_text(caption), buttons=rows, parse_mode='html')
     deposit_input.pop(uid, None)
     asyncio.create_task(poll_famgateway_deposit(dep_id, order_id, uid, sent.id))
     try:
@@ -2027,6 +2205,7 @@ async def generate_deposit_qr(event, uid):
       pass
   except Exception as ex:
     logger.exception('Gateway order creation failed (%s)', provider)
+    await notify_admins(f"<b>Gateway error</b> ({html.escape(label)}) for user <code>{uid}</code>:\n<code>{html.escape(str(ex))[:300]}</code>", ids=[ADMIN_ID])
     await safe_callback_answer(event, 'Payment order could not be created. Please try again or contact support.', alert=True)
     try:
       await e_edit_or_send(event, custom_emoji_text(f"{P_NO} <b>Payment creation failed.</b>\nPlease try again, or choose another gateway."), [[Button.inline('Try Again', 'dep_menu_cb', style='primary')]])
@@ -2305,7 +2484,7 @@ async def admin_panel_handler(event):
     ])
     btns.append([
       Button.inline("Update Welcome Photo", "adm_update_welcome_photo", style="primary"),
-      Button.inline("Change Logs Channel", "adm_changelogs", style="primary")
+      Button.inline("Proofs Channel", "adm_changelogs", style="primary")
     ])
     btns.append([
       Button.inline("Backup Users", "adm_backupusr", style="primary"), 
@@ -2319,6 +2498,9 @@ async def admin_panel_handler(event):
       Button.inline("Redeem Codes", "adm_redeemcodes", style="primary"),
       Button.inline("Digital Shop", "adm_digitalshop", style="success")
     ])
+
+  if uid == ADMIN_ID or has_perm(uid, 'p_settings') or has_perm(uid, 'p_stats'):
+    btns.append([Button.inline("Pro Tools (Reports, Alerts, Export)", "adm_t_menu", style="success")])
 
   if uid == ADMIN_ID:
     btns.append([Button.inline("Manage Admins", "adm_manageadmins", style="danger")])
@@ -2448,6 +2630,320 @@ async def gw_admin_detail(event, provider):
   ]
   return await event.edit(custom_emoji_text(msg), buttons=btns)
 
+# ================= ADMIN PRO TOOLS =================
+from datetime import timedelta
+BOT_START_TS = time.time()
+IST_OFF = "'+330 minutes'"
+TOOL_PERMS = {
+  'p_stats': {'t_rev', 't_topdep', 't_topbuy', 't_recdep', 't_record', 't_pend', 't_low', 't_sys', 't_expdep', 't_exporders', 't_report'},
+  'p_bal': {'t_banned', 't_unban', 't_msg'},
+  'p_settings': {'t_mindep', 't_proofs', 't_lowlim', 't_testlog', 't_tg', 't_pendclear'},
+}
+TOGGLES = {
+  'newuser': ('notify_new_user', 'New-user alerts'),
+  'saledm': ('notify_sale_dm', 'Sale/deposit DM alerts'),
+  'daily': ('daily_report', 'Daily report 11:55 PM'),
+  'lowstock': ('low_stock_alerts', 'Low-stock alerts'),
+}
+
+def ist_now():
+  return datetime.utcnow() + timedelta(minutes=330)
+
+def _period_clause(col, period):
+  if period == 'today':
+    return f"date({col}, {IST_OFF}) = date('now', {IST_OFF})"
+  if period == '7d':
+    return f"date({col}, {IST_OFF}) >= date('now', {IST_OFF}, '-6 days')"
+  if period == '30d':
+    return f"date({col}, {IST_OFF}) >= date('now', {IST_OFF}, '-29 days')"
+  return "1=1"
+
+def build_revenue_report(periods=(("Today", "today"), ("Last 7 days", "7d"), ("Last 30 days", "30d"), ("All time", "all"))):
+  lines = ["<b>REVENUE REPORT (IST)</b>"]
+  for label, p in periods:
+    d = cur.execute(f"SELECT COUNT(*), COALESCE(SUM(amount),0) FROM deposits WHERE status='approved' AND {_period_clause('date', p)}").fetchone()
+    o = cur.execute(f"SELECT COUNT(*), COALESCE(SUM(price),0) FROM orders WHERE {_period_clause('date', p)}").fetchone()
+    m = cur.execute(f"SELECT COUNT(*), COALESCE(SUM(total_price),0) FROM smm_orders WHERE {_period_clause('date', p)}").fetchone()
+    u = cur.execute(f"SELECT COUNT(*) FROM users WHERE {_period_clause('joined_date', p)}").fetchone()[0]
+    lines.append(
+      f"\n<b>{label}</b>\n"
+      f"New users: {u}\n"
+      f"Deposits: {d[0]} = Rs{d[1]}\n"
+      f"Account sales: {o[0]} = Rs{o[1]}\n"
+      f"SMM orders: {m[0]} = Rs{float(m[1]):.2f}"
+    )
+  return "\n".join(lines)
+
+def low_stock_rows(limit=20):
+  return cur.execute(
+    "SELECT country_name, COALESCE(SUM(available),0) AS n FROM stock GROUP BY country_name ORDER BY n ASC, country_name ASC LIMIT ?",
+    (limit,)).fetchall()
+
+def low_stock_threshold():
+  try:
+    return max(0, int(get_setting('low_stock_threshold', '3')))
+  except (TypeError, ValueError):
+    return 3
+
+def build_daily_report():
+  total_users = cur.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+  pending = cur.execute("SELECT COUNT(*) FROM deposits WHERE status='pending'").fetchone()[0]
+  stock = cur.execute("SELECT COUNT(*) FROM stock WHERE available=1").fetchone()[0]
+  low = [r for r in low_stock_rows(200) if r[1] <= low_stock_threshold()]
+  txt = build_revenue_report((("Today", "today"),))
+  txt += (f"\n\nTotal users: {total_users}\nPending deposits: {pending}\nAccounts in stock: {stock}\n"
+          f"Low-stock countries: {len(low)}")
+  return "<b>DAILY REPORT</b>\n\n" + txt
+
+async def daily_report_loop():
+  """Send the owner a daily summary once, after 23:55 IST."""
+  while True:
+    try:
+      await asyncio.sleep(60)
+      if get_setting('daily_report', 'on') != 'on':
+        continue
+      now = ist_now()
+      today = now.strftime('%Y-%m-%d')
+      if (now.hour, now.minute) >= (23, 55) and get_setting('last_daily_report', '') != today:
+        set_setting('last_daily_report', today)
+        await notify_admins(build_daily_report(), ids=[ADMIN_ID])
+    except Exception as ex:
+      logger.error(f"Daily report loop error: {ex}")
+
+_low_stock_seen = {}
+async def low_stock_loop():
+  """Alert admins when a country's stock drops to the threshold (once per drop)."""
+  global _low_stock_seen
+  while True:
+    try:
+      await asyncio.sleep(900)
+      if get_setting('low_stock_alerts', 'on') != 'on':
+        continue
+      thr = low_stock_threshold()
+      low = {c: n for c, n in low_stock_rows(500) if n <= thr}
+      fresh = [(c, n) for c, n in low.items() if c not in _low_stock_seen]
+      _low_stock_seen = low
+      if fresh:
+        lines = "\n".join(f"{html.escape(str(c))}: <b>{n}</b> left" for c, n in fresh[:25])
+        await notify_admins(f"<b>LOW STOCK ALERT</b> (limit {thr})\n\n{lines}")
+    except Exception as ex:
+      logger.error(f"Low stock loop error: {ex}")
+
+def _uptime_text():
+  secs = int(time.time() - BOT_START_TS)
+  d, r = divmod(secs, 86400); h, r = divmod(r, 3600); m, _ = divmod(r, 60)
+  return f"{d}d {h}h {m}m"
+
+def _fmt_user(uid_val):
+  return f"<code>{uid_val}</code>"
+
+async def admin_tools_menu(event):
+  def onoff(key):
+    return 'ON' if get_setting(TOGGLES[key][0], 'on') == 'on' else 'OFF'
+  msg = ("<b>PRO TOOLS</b>\n\nReports, alerts, exports and quick settings.\n"
+         f"Min deposit: Rs{get_min_deposit()} | Low-stock limit: {low_stock_threshold()}\n"
+         f"Proofs link: {html.escape(get_proofs_url())}")
+  btns = [
+    [Button.inline("Revenue", "adm_t_rev", style="primary"), Button.inline("Top Depositors", "adm_t_topdep", style="primary"), Button.inline("Top Buyers", "adm_t_topbuy", style="primary")],
+    [Button.inline("Recent Deposits", "adm_t_recdep", style="primary"), Button.inline("Recent Orders", "adm_t_record", style="primary")],
+    [Button.inline("Pending Deposits", "adm_t_pend", style="primary"), Button.inline("Low Stock", "adm_t_low", style="primary")],
+    [Button.inline("Banned Users", "adm_t_banned", style="danger"), Button.inline("System Info", "adm_t_sys", style="primary")],
+    [Button.inline("Export Deposits", "adm_t_expdep", style="success"), Button.inline("Export Orders", "adm_t_exporders", style="success")],
+    [Button.inline("Message a User", "adm_t_msg", style="success"), Button.inline("Daily Report Now", "adm_t_report", style="success")],
+    [Button.inline("Set Min Deposit", "adm_t_mindep", style="primary"), Button.inline("Set Proofs Link", "adm_t_proofs", style="primary")],
+    [Button.inline("Set Low-Stock Limit", "adm_t_lowlim", style="primary"), Button.inline("Test Proofs Channel", "adm_t_testlog", style="primary")],
+    [Button.inline(f"New-user alerts: {onoff('newuser')}", "adm_t_tg|newuser", style="primary"), Button.inline(f"Sale DM alerts: {onoff('saledm')}", "adm_t_tg|saledm", style="primary")],
+    [Button.inline(f"Daily report: {onoff('daily')}", "adm_t_tg|daily", style="primary"), Button.inline(f"Stock alerts: {onoff('lowstock')}", "adm_t_tg|lowstock", style="primary")],
+    [Button.inline("Back to Admin", "adm_adminmain", style="primary")],
+  ]
+  return await event.edit(custom_emoji_text(msg), buttons=btns)
+
+async def _tools_ask(conv, prompt):
+  await conv.send_message(custom_emoji_text(prompt + "\n\n<i>(Type /cancel to abort)</i>"))
+  resp = await conv.get_response()
+  text = (resp.text or '').strip()
+  if text.lower() == '/cancel':
+    return None
+  return text
+
+async def admin_tools_actions(event, action_data, uid, chat):
+  name = action_data.split("|")[0]
+  back = [[Button.inline("Back to Tools", "adm_t_menu", style="primary")]]
+
+  if name != "t_menu":
+    needed = next((perm for perm, names in TOOL_PERMS.items() if name in names), None)
+    if needed is None or not has_perm(uid, needed):
+      return await safe_callback_answer(event, "You do not have permission for this tool.", alert=True)
+  elif not (has_perm(uid, 'p_settings') or has_perm(uid, 'p_stats')):
+    return await safe_callback_answer(event, "No permission.", alert=True)
+
+  try:
+    if name == "t_menu":
+      return await admin_tools_menu(event)
+
+    if name == "t_rev":
+      return await event.edit(custom_emoji_text(build_revenue_report()), buttons=back)
+
+    if name == "t_report":
+      await safe_callback_answer(event, "Report sent to you.", alert=False)
+      await bot.send_message(chat, custom_emoji_text(build_daily_report()), parse_mode='html')
+      return
+
+    if name == "t_topdep":
+      rows = cur.execute("SELECT user_id, total_deposited FROM users WHERE total_deposited>0 ORDER BY total_deposited DESC LIMIT 10").fetchall()
+      lines = [f"{i}. {_fmt_user(r[0])} - Rs{r[1]}" for i, r in enumerate(rows, 1)] or ["No deposits yet."]
+      return await event.edit(custom_emoji_text("<b>TOP DEPOSITORS</b>\n\n" + "\n".join(lines)), buttons=back)
+
+    if name == "t_topbuy":
+      rows = cur.execute("SELECT user_id, COUNT(*), COALESCE(SUM(price),0) FROM orders GROUP BY user_id ORDER BY SUM(price) DESC LIMIT 10").fetchall()
+      lines = [f"{i}. {_fmt_user(r[0])} - {r[1]} accounts - Rs{r[2]}" for i, r in enumerate(rows, 1)] or ["No sales yet."]
+      return await event.edit(custom_emoji_text("<b>TOP BUYERS</b>\n\n" + "\n".join(lines)), buttons=back)
+
+    if name == "t_recdep":
+      rows = cur.execute(f"SELECT id, user_id, amount, method_name, status, datetime(date, {IST_OFF}) FROM deposits ORDER BY id DESC LIMIT 15").fetchall()
+      lines = [f"#{r[0]} {_fmt_user(r[1])} Rs{r[2]} {html.escape(str(r[3] or ''))} [{html.escape(str(r[4]))}] {r[5]}" for r in rows] or ["No deposits yet."]
+      return await event.edit(custom_emoji_text("<b>RECENT DEPOSITS (IST)</b>\n\n" + "\n".join(lines)), buttons=back)
+
+    if name == "t_record":
+      rows = cur.execute(f"SELECT id, user_id, country, year, price, datetime(date, {IST_OFF}) FROM orders ORDER BY id DESC LIMIT 15").fetchall()
+      lines = [f"#{r[0]} {_fmt_user(r[1])} {html.escape(str(r[2]))} {r[3]} Rs{r[4]} {r[5]}" for r in rows] or ["No orders yet."]
+      return await event.edit(custom_emoji_text("<b>RECENT ACCOUNT ORDERS (IST)</b>\n\n" + "\n".join(lines)), buttons=back)
+
+    if name == "t_pend":
+      rows = cur.execute(
+        "SELECT id, user_id, amount, COALESCE(gateway_provider,''), CAST((julianday('now') - julianday(date)) * 1440 AS INTEGER) "
+        "FROM deposits WHERE status='pending' ORDER BY id DESC LIMIT 15").fetchall()
+      lines = [f"#{r[0]} {_fmt_user(r[1])} Rs{r[2]} {html.escape(r[3])} - {r[4]} min ago" for r in rows] or ["No pending deposits."]
+      btns = [[Button.inline("Expire pending older than 60 min", "adm_t_pendclear", style="danger")]] + back
+      return await event.edit(custom_emoji_text("<b>PENDING DEPOSITS</b>\n\n" + "\n".join(lines)), buttons=btns)
+
+    if name == "t_pendclear":
+      cur.execute("UPDATE deposits SET status='expired' WHERE status='pending' AND datetime(date) < datetime('now','-60 minutes')")
+      n = cur.rowcount
+      db.commit()
+      await safe_callback_answer(event, f"{n} stale pending deposit(s) expired.", alert=True)
+      return await event.edit(custom_emoji_text(f"<b>Done.</b> {n} stale pending deposit(s) expired."), buttons=back)
+
+    if name == "t_low":
+      thr = low_stock_threshold()
+      rows = low_stock_rows(20)
+      lines = [f"{'LOW ' if n <= thr else ''}{html.escape(str(c))}: {n}" for c, n in rows] or ["No stock data."]
+      return await event.edit(custom_emoji_text(f"<b>STOCK LEVELS</b> (alert limit {thr})\n\nLowest first:\n" + "\n".join(lines)), buttons=back)
+
+    if name == "t_banned":
+      rows = cur.execute("SELECT user_id FROM users WHERE banned=1 LIMIT 20").fetchall()
+      btns = []
+      for r in rows:
+        btns.append([Button.inline(f"Unban {r[0]}", f"adm_t_unban|{r[0]}", style="success")])
+      btns += back
+      text = "<b>BANNED USERS</b>\n\n" + ("Tap a user to unban." if rows else "No banned users.")
+      return await event.edit(custom_emoji_text(text), buttons=btns)
+
+    if name == "t_unban":
+      target = int(action_data.split("|")[1])
+      cur.execute("UPDATE users SET banned=0 WHERE user_id=?", (target,))
+      db.commit()
+      await safe_callback_answer(event, f"User {target} unbanned.", alert=True)
+      return await event.edit(custom_emoji_text(f"<b>User</b> <code>{target}</code> <b>unbanned.</b>"), buttons=[[Button.inline("Banned List", "adm_t_banned", style="primary")]] + back)
+
+    if name == "t_sys":
+      try:
+        db_mb = os.path.getsize("otp_bot_final.db") / (1024 * 1024)
+      except OSError:
+        db_mb = 0
+      gw_lines = "\n".join(f"{g['label']}: {'ON' if gw_ready(p) else ('OFF' if base_cfg_ok(p) else 'not configured')}" for p, g in GATEWAYS.items())
+      msg = (f"<b>SYSTEM INFO</b>\n\nUptime: {_uptime_text()}\nBot: {'ON' if is_bot_online() else 'OFF'}\n"
+             f"Database: {db_mb:.2f} MB\nUsers: {cur.execute('SELECT COUNT(*) FROM users').fetchone()[0]}\n"
+             f"Admins: {len(get_all_admin_ids())}\nProofs channel ID: <code>{html.escape(str(get_log_channel_id()))}</code>\n\n{gw_lines}")
+      return await event.edit(custom_emoji_text(msg), buttons=back)
+
+    if name in ("t_expdep", "t_exporders"):
+      table = "deposits" if name == "t_expdep" else "orders"
+      c = cur.execute(f"SELECT * FROM {table} ORDER BY id DESC")
+      headers = [d[0] for d in c.description]
+      rows = c.fetchall()
+      path = f"export_{table}_{int(time.time())}.csv"
+      try:
+        with open(path, "w", newline="", encoding="utf-8") as f:
+          w = csv.writer(f); w.writerow(headers); w.writerows(rows)
+        await safe_callback_answer(event, "Preparing file...", alert=False)
+        await bot.send_file(chat, path, caption=f"{table.title()} export: {len(rows)} rows")
+      finally:
+        if os.path.exists(path):
+          os.remove(path)
+      return
+
+    if name == "t_tg":
+      key = action_data.split("|")[1]
+      if key not in TOGGLES:
+        return await safe_callback_answer(event, "Unknown toggle.", alert=True)
+      setting_key = TOGGLES[key][0]
+      set_setting(setting_key, 'off' if get_setting(setting_key, 'on') == 'on' else 'on')
+      return await admin_tools_menu(event)
+
+    if name == "t_testlog":
+      ok = await _send_selling_log("<b>Proofs channel test message.</b>", dm_admins=False)
+      return await safe_callback_answer(event, "Test posted to the proofs channel." if ok else "Could not post. Make the bot an Administrator of the channel and check the channel ID.", alert=True)
+
+    # ---- tools that need typed input ----
+    if name in ("t_mindep", "t_proofs", "t_lowlim", "t_msg"):
+      await event.delete()
+      async with bot.conversation(chat, timeout=300) as conv:
+        try:
+          if name == "t_mindep":
+            val = await _tools_ask(conv, f"Current minimum deposit: Rs{get_min_deposit()}\nSend the new minimum deposit amount (number, 1 or more):")
+            if val is None: return await conv.send_message("Cancelled.", buttons=back)
+            n = int(val)
+            if n < 1 or n > 100000: raise ValueError
+            set_setting('min_deposit', str(n))
+            return await conv.send_message(custom_emoji_text(f"<b>Minimum deposit set to Rs{n}.</b>"), buttons=back)
+
+          if name == "t_proofs":
+            val = await _tools_ask(conv, f"Current Proofs link: {html.escape(get_proofs_url())}\nSend the new Telegram link or @username for the Proofs button:")
+            if val is None: return await conv.send_message("Cancelled.", buttons=back)
+            url = _normalize_tg_url(val, "")
+            if not url:
+              return await conv.send_message("Invalid link. Use a t.me link or @username.", buttons=back)
+            set_setting('proofs_url', url)
+            return await conv.send_message(custom_emoji_text(f"<b>Proofs button now opens:</b> {html.escape(url)}"), buttons=back)
+
+          if name == "t_lowlim":
+            val = await _tools_ask(conv, f"Current low-stock limit: {low_stock_threshold()}\nSend a new number (0-1000). Alerts fire when a country has this many accounts or fewer:")
+            if val is None: return await conv.send_message("Cancelled.", buttons=back)
+            n = int(val)
+            if n < 0 or n > 1000: raise ValueError
+            set_setting('low_stock_threshold', str(n))
+            return await conv.send_message(custom_emoji_text(f"<b>Low-stock limit set to {n}.</b>"), buttons=back)
+
+          if name == "t_msg":
+            val = await _tools_ask(conv, "Send the User ID to message:")
+            if val is None: return await conv.send_message("Cancelled.", buttons=back)
+            target = int(val)
+            text = await _tools_ask(conv, "Send the message text:")
+            if text is None: return await conv.send_message("Cancelled.", buttons=back)
+            try:
+              await bot.send_message(target, "<b>Message from Admin</b>\n\n" + html.escape(text), parse_mode='html')
+              return await conv.send_message(custom_emoji_text(f"<b>Message delivered to</b> <code>{target}</code>."), buttons=back)
+            except Exception as ex:
+              return await conv.send_message(custom_emoji_text(f"Could not deliver: {html.escape(str(ex))[:200]}"), buttons=back)
+        except ValueError:
+          return await conv.send_message("Invalid input. Please start again.", buttons=back)
+        except asyncio.TimeoutError:
+          return await conv.send_message("Timed out. Please start again.", buttons=back)
+      return
+
+    return await safe_callback_answer(event, "Unknown tool.", alert=True)
+  except Exception as ex:
+    logger.error(f"Admin tool error ({action_data}): {ex}", exc_info=True)
+    try:
+      await safe_callback_answer(event, "This tool failed. Check the bot logs.", alert=True)
+    except Exception:
+      pass
+
+def base_cfg_ok(provider):
+  base, key = gw_config(provider)
+  return bool(base and key)
+
 async def admin_actions(event):
   data_full = event.data.decode()
   if not data_full.startswith("adm_"): return
@@ -2459,6 +2955,9 @@ async def admin_actions(event):
     await event.delete()
     class FakeEvent: chat_id = chat; sender_id = uid
     return await admin_panel_handler(FakeEvent())
+
+  if action_data.startswith("t_"):
+    return await admin_tools_actions(event, action_data, uid, chat)
 
   if action_data == "togglebot" and has_perm(uid, 'p_settings'):
     new_status = 'off' if is_bot_online() else 'on'
@@ -2945,7 +3444,7 @@ async def admin_actions(event):
         cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('log_channel_id', ?)", (new_ch,))
         db.commit()
         await conv.send_message(custom_emoji_text(f"{P_YES} <b>Logs Channel ID updated successfully:</b> <code>{new_ch}</code>"))
-        if await _send_selling_log("<b>Logs channel connected successfully.</b>"):
+        if await _send_selling_log("<b>Proofs channel connected successfully.</b>", dm_admins=False):
           await conv.send_message(custom_emoji_text(f"{P_YES} Test message posted to the logs channel."))
         else:
           await conv.send_message(custom_emoji_text(f"{P_WARN} Could not post to that channel. Add the bot as an <b>Administrator</b> there and check the ID."))
@@ -3352,6 +3851,30 @@ async def handle_admin_command(e):
     logger.exception("Admin panel error for %s", uid)
     await e.respond("Admin panel could not be opened. Please check the bot logs.")
 
+@bot.on(events.NewMessage(pattern=r"(?i)^/stats(?:@\w+)?\s*$"))
+async def handle_stats_command(e):
+  uid = e.sender_id
+  if not uid or not is_admin(uid):
+    return
+  ist = "'+330 minutes'"
+  total_users = cur.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+  new_today = cur.execute(f"SELECT COUNT(*) FROM users WHERE date(joined_date, {ist}) = date('now', {ist})").fetchone()[0]
+  dep = cur.execute(f"SELECT COUNT(*), COALESCE(SUM(amount),0) FROM deposits WHERE status='approved' AND date(date, {ist}) = date('now', {ist})").fetchone()
+  sales = cur.execute(f"SELECT COUNT(*), COALESCE(SUM(price),0) FROM orders WHERE date(date, {ist}) = date('now', {ist})").fetchone()
+  smm = cur.execute(f"SELECT COUNT(*), COALESCE(SUM(total_price),0) FROM smm_orders WHERE date(date, {ist}) = date('now', {ist})").fetchone()
+  pending = cur.execute("SELECT COUNT(*) FROM deposits WHERE status='pending'").fetchone()[0]
+  stock = cur.execute("SELECT COUNT(*) FROM stock WHERE available=1").fetchone()[0]
+  msg = (
+    "<b>TODAY'S SNAPSHOT (IST)</b>\n\n"
+    f"Total Users: <b>{total_users}</b> (new today: {new_today})\n"
+    f"Deposits: <b>{dep[0]}</b> = Rs{dep[1]}\n"
+    f"Account Sales: <b>{sales[0]}</b> = Rs{sales[1]}\n"
+    f"SMM Orders: <b>{smm[0]}</b> = Rs{float(smm[1]):.2f}\n"
+    f"Pending Deposits: {pending}\n"
+    f"Accounts In Stock: {stock}"
+  )
+  await e.respond(msg, parse_mode='html')
+
 @bot.on(events.NewMessage(pattern=r"(?i)^/start"))
 async def handle_start(e):
   try:
@@ -3721,6 +4244,20 @@ async def handle_callback_query(e):
     elif data == "dep_menu_cb":
       await deposit_menu(e)
 
+    elif data.startswith("dep_verify|"):
+      try:
+        dep_id = int(data.split("|", 1)[1])
+      except ValueError:
+        return await safe_callback_answer(e, "Invalid payment reference.", alert=True)
+      await handle_verify_payment(e, uid, dep_id)
+
+    elif data.startswith("dep_cancel|"):
+      try:
+        dep_id = int(data.split("|", 1)[1])
+      except ValueError:
+        return await safe_callback_answer(e, "Invalid payment reference.", alert=True)
+      await handle_cancel_deposit(e, uid, dep_id)
+
     elif data.startswith("dep_gw|"):
       provider = data.split("|", 1)[1]
       if provider not in GATEWAYS or not gw_ready(provider):
@@ -3871,10 +4408,16 @@ async def handle_callback_query(e):
 
 async def main():
   print("BOT STARTED SUCCESSFULLY")
+  try:
+    await notify_admins("<b>Bot started successfully.</b>", ids=[ADMIN_ID])
+  except Exception:
+    pass
   # Resume pending FamGateway verifications after a process restart.
-  pending = cur.execute("SELECT id, gateway_order_id, user_id FROM deposits WHERE status='pending' AND COALESCE(gateway_order_id,'') != ''").fetchall()
+  pending = cur.execute("SELECT id, gateway_order_id, user_id FROM deposits WHERE status='pending' AND COALESCE(gateway_order_id,'') != '' AND datetime(date) > datetime('now','-120 minutes')").fetchall()
   for dep_id, order_id, uid in pending:
     asyncio.create_task(poll_famgateway_deposit(dep_id, order_id, uid, None))
+  asyncio.create_task(daily_report_loop())
+  asyncio.create_task(low_stock_loop())
   await bot.run_until_disconnected()
 
 if __name__ == '__main__':
